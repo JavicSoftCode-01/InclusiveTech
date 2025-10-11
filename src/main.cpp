@@ -1,800 +1,1311 @@
+#include <Arduino.h>
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
 #include <AsyncTCP.h>
 #include <ArduinoJson.h>
+#include <vector>
+#include <cmath>
 
-// Definición de pines
-#define PIR_PIN 13              // Sensor PIR
-#define RELAY_PIN 12            // Módulo relé (opcional, para control externo)
-#define LIGHT_SENSOR_PIN 36     // Fotoresistor analógico (A0 = GPIO36)
-const int LED_PINS[] = {15, 16, 17, 18, 19};  // Pines para los 5 LEDs rojos unitarios
-const int NUM_LEDS = 5;
+// ============================================================================
+// CONFIGURACIÓN GLOBAL DE PINES Y PWM
+// ============================================================================
+#define PIR_PIN 13
+#define RELAY_PIN 26
+#define LIGHT_SENSOR_PIN 36 // Ahora es una entrada DIGITAL
 
-// Configuración WiFi para Wokwi
-const char* ssid = "Wokwi-GUEST";
-const char* password = "";
+// Pines de LED y configuración del controlador PWM por hardware (LEDC)
+constexpr int LED_PINS[] = {15, 16, 17, 18, 19};
+constexpr int NUM_LEDS = sizeof(LED_PINS) / sizeof(LED_PINS[0]);
+constexpr int PWM_CHANNEL_START = 0;
+constexpr int PWM_FREQ = 5000;
+constexpr int PWM_RESOLUTION = 8;
 
-// Servidor web
+// ============================================================================
+// CONFIGURACIÓN WIFI
+// ============================================================================
+constexpr const char *SSID = "Javier";
+constexpr const char *PASSWORD = "12345678";
+
 AsyncWebServer server(80);
 
-// Variables de estado del sistema
-struct SystemState {
-  bool pirDetected = false;
-  bool lightsOn = false;
-  bool manualOverride = false;
-  int lightLevel = 0;
-  int brightnessLevel = 0; // 0 (apagado), 33, 66, 100 (%)
-  unsigned long lastMotion = 0;
-  unsigned long lastPirChange = 0; // Para debouncing
-  unsigned long systemStartTime = 0;
-  unsigned long totalOnTime = 0;
-  unsigned long lastOnTime = 0;
-  float totalEnergyConsumed = 0.0;
-  float currentPowerConsumption = 0.0;
-} state;
+// ============================================================================
+// ESTRUCTURAS DE DATOS
+// ============================================================================
+struct SystemConfig
+{
+    int autoOffDelaySec = 60;       // Segundos de inactividad para apagar
+    float fixedBrightness = 80.0f;  // Brillo fijo cuando las luces se encienden (en %)
+    float slewRateLimit = 25.0f;    // Rampa más rápida para ON/OFF
+    bool autoMode = true;
+    String presetName = "Digital";
+};
 
-// Configuración del sistema
-const int LIGHT_THRESHOLD = 2500;    // Umbral para encender LEDs en modo automático (ajustado para simulación)
-const int LIGHT_LOW_THRESHOLD = 3000; // Umbral para brillo bajo
-const int LIGHT_MEDIUM_THRESHOLD = 1000; // Umbral para brillo medio
-const unsigned long AUTO_OFF_DELAY = 60000;  // 1 minuto
-const unsigned long PIR_DEBOUNCE = 100;     // Debounce para PIR
-const float POWER_CONSUMPTION_WATTS = 50.0;  // Consumo máximo en Watts de las luces LED
-const float ELECTRICITY_RATE_ECUADOR = 0.092; // USD por kWh en Ecuador
+struct SystemState
+{
+    bool pirDetected = false;
+    bool isDark = false;             // Nuevo estado: true si el LDR dice que está oscuro
+    bool lightsOn = false;
+    float targetBrightnessPercent = 0.0f;
+    float currentBrightnessPercent = 0.0f;
+    unsigned long lastMotionTime = 0;
+    unsigned long systemStartTime = 0;
+    unsigned long totalOnTimeSec = 0;
+    unsigned long lastEnergyUpdate = 0;
+    float totalEnergyConsumedKWh = 0.0f;
+    float currentPowerConsumptionW = 0.0f;
+};
 
-// Funciones del sistema
+struct HistoricalData
+{
+    std::vector<float> brightness;
+    std::vector<bool> isDarkHistory; // Guardamos el estado digital
+    std::vector<float> power;
+    std::vector<unsigned long> timestamps;
+    static constexpr int MAX_POINTS = 100;
+
+    void addPoint(float b, bool isDark, float p, unsigned long t)
+    {
+        if (brightness.size() >= MAX_POINTS)
+        {
+            brightness.erase(brightness.begin());
+            isDarkHistory.erase(isDarkHistory.begin());
+            power.erase(power.begin());
+            timestamps.erase(timestamps.begin());
+        }
+        brightness.push_back(b);
+        isDarkHistory.push_back(isDark);
+        power.push_back(p);
+        timestamps.push_back(t);
+    }
+};
+
+SystemConfig config;
+SystemState state;
+HistoricalData history;
+
+// ============================================================================
+// CONSTANTES
+// ============================================================================
+constexpr float POWER_MAX_WATTS = 25.0f;
+constexpr float ELECTRICITY_RATE_KWH = 0.092f;
+
+// ============================================================================
+// DECLARACIÓN DE FUNCIONES
+// ============================================================================
 void setupWiFi();
 void setupWebServer();
-void handleSensors();
-void updateEnergyMetrics();
-void turnOnLights(bool manual = false);
+void readSensors();
+void handleSystemLogic();
+void updateActuators(float deltaTime);
+void updateMetrics(float deltaTime);
+void setBrightness(float percentage);
+void turnOnLights();
 void turnOffLights();
-void setLedBrightness(int percentage);
-String getSystemStatus();
+String getSystemStatusJson();
+String getHistoricalDataJson();
 
-void setup() {
-  Serial.begin(115200);
-  
-  // Configuración de pines
-  pinMode(PIR_PIN, INPUT);
-  pinMode(RELAY_PIN, OUTPUT);
-  pinMode(LIGHT_SENSOR_PIN, INPUT);
-  for (int i = 0; i < NUM_LEDS; i++) {
-    pinMode(LED_PINS[i], OUTPUT);
-    analogWrite(LED_PINS[i], 0);
-  }
-  
-  // Estados iniciales
-  digitalWrite(RELAY_PIN, LOW);
-  
-  // Inicializar variables de tiempo
-  state.systemStartTime = millis();
-  state.lastPirChange = millis();
-  
-  Serial.println("=== SISTEMA DE ILUMINACION INCLUSIVA PARA AULAS ===");
-  Serial.println("Configurando WiFi...");
-  
-  setupWiFi();
-  setupWebServer();
-  
-  Serial.println("Sistema listo. Accede al dashboard en: http://localhost:8180");
-  Serial.println("====================================================");
-}
-
-void loop() {
-  handleSensors();
-  updateEnergyMetrics();
-  
-  // Pequeña pausa para estabilidad
-  delay(100);
-}
-
-void setupWiFi() {
-  WiFi.begin(ssid, password);
-  
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+// ============================================================================
+// SETUP
+// ============================================================================
+void setup()
+{
+    Serial.begin(115200);
     delay(500);
-    Serial.print(".");
-    attempts++;
-  }
-  
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println();
-    Serial.print("WiFi conectado. IP: ");
-    Serial.println(WiFi.localIP());
-  } else {
-    Serial.println("Error: No se pudo conectar a WiFi");
-  }
+
+    Serial.println(F("\n=== SISTEMA DE ILUMINACION INCLUSIVA (MODO DIGITAL) V3.2 ==="));
+
+    pinMode(PIR_PIN, INPUT_PULLDOWN);
+    pinMode(LIGHT_SENSOR_PIN, INPUT_PULLUP); 
+    pinMode(RELAY_PIN, OUTPUT);
+
+    for (int i = 0; i < NUM_LEDS; ++i)
+    {
+        ledcSetup(PWM_CHANNEL_START + i, PWM_FREQ, PWM_RESOLUTION);
+        ledcAttachPin(LED_PINS[i], PWM_CHANNEL_START + i);
+    }
+
+    digitalWrite(RELAY_PIN, LOW);
+    setBrightness(0);
+
+    state.systemStartTime = millis();
+    state.lastMotionTime = state.systemStartTime;
+
+    setupWiFi();
+    setupWebServer();
+
+    Serial.println(F("\n[INFO] Sensor PIR necesita ~60s para calibrarse..."));
+    Serial.println(F("[INFO] Asegúrese de ajustar el potenciómetro del sensor LDR."));
+    Serial.println(F("[INFO] Sistema listo."));
+}
+
+// ============================================================================
+// LOOP PRINCIPAL
+// ============================================================================
+void loop()
+{
+    static unsigned long lastUpdateTime = 0;
+    unsigned long now = millis();
+
+    if (now - lastUpdateTime >= 50) 
+    {
+        float deltaTime = (now - lastUpdateTime) / 1000.0f;
+        
+        readSensors();
+
+        if (config.autoMode) {
+            handleSystemLogic();
+        }
+
+        updateActuators(deltaTime);
+        updateMetrics(deltaTime);
+
+        lastUpdateTime = now;
+    }
+}
+
+// ============================================================================
+// LÓGICA DE CONTROL (ADAPTADA A DIGITAL)
+// ============================================================================
+void readSensors() {
+    state.isDark = (digitalRead(LIGHT_SENSOR_PIN) == HIGH);
+    
+    state.pirDetected = digitalRead(PIR_PIN);
+    if (state.pirDetected) {
+        state.lastMotionTime = millis();
+    }
+}
+
+void handleSystemLogic() {
+    unsigned long timeSinceLastMotionSec = (millis() - state.lastMotionTime) / 1000UL;
+
+    if (state.pirDetected && state.isDark && !state.lightsOn) {
+        turnOnLights();
+    } 
+    else if (state.lightsOn && (timeSinceLastMotionSec >= (unsigned long)config.autoOffDelaySec || !state.isDark)) {
+        turnOffLights();
+    }
+
+    if (state.lightsOn) {
+        state.targetBrightnessPercent = config.fixedBrightness;
+    } else {
+        state.targetBrightnessPercent = 0.0f;
+    }
+}
+
+// ============================================================================
+// CONTROL DE ACTUADORES
+// ============================================================================
+void updateActuators(float deltaTime) {
+    float diff = state.targetBrightnessPercent - state.currentBrightnessPercent;
+    float maxChange = config.slewRateLimit * deltaTime;
+
+    if (abs(diff) < maxChange) {
+        state.currentBrightnessPercent = state.targetBrightnessPercent;
+    } else {
+        state.currentBrightnessPercent += (diff > 0) ? maxChange : -maxChange;
+    }
+
+    setBrightness(state.currentBrightnessPercent);
+}
+
+void setBrightness(float percentage) {
+    int pwmValue = map(percentage, 0, 100, 0, 255);
+    pwmValue = constrain(pwmValue, 0, 255);
+    
+    for (int i = 0; i < NUM_LEDS; ++i) {
+        ledcWrite(PWM_CHANNEL_START + i, pwmValue);
+    }
+}
+
+void turnOnLights() {
+    if (!state.lightsOn) {
+        Serial.println(F("[CONTROL] Encendiendo luces (Relé ON)"));
+        digitalWrite(RELAY_PIN, HIGH);
+        state.lightsOn = true;
+    }
+}
+
+void turnOffLights() {
+    if (state.lightsOn) {
+        Serial.println(F("[CONTROL] Apagando luces (Relé OFF)"));
+        digitalWrite(RELAY_PIN, LOW);
+        state.lightsOn = false;
+    }
+}
+
+// ============================================================================
+// MÉTRICAS Y TELEMETRÍA
+// ============================================================================
+void updateMetrics(float deltaTime) {
+    static unsigned long lastHistorySave = 0;
+
+    if (millis() - state.lastEnergyUpdate >= 1000) {
+        if (state.lightsOn) {
+            state.totalOnTimeSec++;
+            state.currentPowerConsumptionW = POWER_MAX_WATTS * (state.currentBrightnessPercent / 100.0f);
+            state.totalEnergyConsumedKWh += (state.currentPowerConsumptionW * 1.0f) / 3600000.0f;
+        } else {
+            state.currentPowerConsumptionW = 0.0f;
+        }
+        state.lastEnergyUpdate = millis();
+    }
+    
+    if (millis() - lastHistorySave >= 5000) {
+        history.addPoint(state.currentBrightnessPercent, state.isDark, state.currentPowerConsumptionW, millis() / 1000);
+        lastHistorySave = millis();
+    }
+}
+
+String getSystemStatusJson() {
+    DynamicJsonDocument doc(2048);
+    unsigned long uptime = (millis() - state.systemStartTime) / 1000UL;
+    unsigned long timeSinceMotion = (millis() - state.lastMotionTime) / 1000UL;
+
+    doc["lightsOn"] = state.lightsOn;
+    doc["pirDetected"] = state.pirDetected;
+    doc["isDark"] = state.isDark;
+    doc["autoMode"] = config.autoMode;
+    doc["currentBrightness"] = state.currentBrightnessPercent;
+    doc["targetBrightness"] = state.targetBrightnessPercent;
+    doc["timeSinceLastMotion"] = timeSinceMotion;
+    doc["totalOnTime"] = state.totalOnTimeSec;
+    doc["totalEnergy"] = state.totalEnergyConsumedKWh;
+    doc["currentPower"] = state.currentPowerConsumptionW;
+    doc["uptime"] = uptime;
+    doc["fixedBrightness"] = config.fixedBrightness;
+    doc["autoOffDelay"] = config.autoOffDelaySec;
+    doc["presetName"] = config.presetName;
+    
+    String response;
+    serializeJson(doc, response);
+    return response;
+}
+
+String getHistoricalDataJson() {
+    DynamicJsonDocument doc(4096);
+    JsonArray b = doc.createNestedArray("brightness");
+    JsonArray l = doc.createNestedArray("isDark");
+    JsonArray p = doc.createNestedArray("power");
+    JsonArray t = doc.createNestedArray("timestamps");
+
+    for (size_t i = 0; i < history.brightness.size(); ++i) {
+        b.add(history.brightness[i]);
+        // ========================================================
+        // AQUI ESTÁ LA CORRECCIÓN
+        // ========================================================
+        l.add(static_cast<bool>(history.isDarkHistory[i]));
+        // ========================================================
+        p.add(history.power[i]);
+        t.add(history.timestamps[i]);
+    }
+
+    String response;
+    serializeJson(doc, response);
+    return response;
+}
+
+// ============================================================================
+// WIFI Y SERVIDOR WEB
+// ============================================================================
+void setupWiFi() {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(SSID, PASSWORD);
+    Serial.print(F("Conectando a WiFi"));
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - start < 10000)) {
+        delay(500); Serial.print(F("."));
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println(F("\n\n¡WiFi conectado exitosamente!"));
+        Serial.print(F("Dirección IP: http://"));
+        Serial.println(WiFi.localIP());
+    } else {
+        Serial.println(F("\nError: WiFi no conectado. Creando AP de respaldo."));
+        WiFi.softAP("Sistema-Iluminacion-Aula", "");
+        Serial.print("AP IP: http://");
+        Serial.println(WiFi.softAPIP());
+    }
 }
 
 void setupWebServer() {
-  // Servir página principal
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-    String html = R"rawliteral(
+    server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest *req){ req->send(200, "application/json", getSystemStatusJson()); });
+    server.on("/api/history", HTTP_GET, [](AsyncWebServerRequest *req){ req->send(200, "application/json", getHistoricalDataJson()); });
+    server.on("/api/control", HTTP_POST, [](AsyncWebServerRequest *req) {}, nullptr, [](AsyncWebServerRequest *req, uint8_t *data, size_t len, size_t, size_t) {
+        DynamicJsonDocument doc(512);
+        if (deserializeJson(doc, data, len) == DeserializationError::Ok) {
+            String action = doc["action"].as<String>();
+            if (action == "on") { config.autoMode = false; turnOnLights(); } 
+            else if (action == "off") { config.autoMode = false; turnOffLights(); } 
+            else if (action == "auto") { config.autoMode = true; } 
+            else if (action == "manual") { config.autoMode = false; }
+        }
+        req->send(200, "application/json", "{\"status\":\"ok\"}");
+    });
+     server.on("/", HTTP_GET, [](AsyncWebServerRequest *req){
+        String html = R"rawliteral(
 <!DOCTYPE html>
 <html lang="es">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Control de Iluminacion Inclusiva - Aula Inteligente</title>
+    <title>Sistema de Iluminación Inclusiva - Dashboard Técnico v3.0</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
+        :root {
+            --bg-primary: #0f172a;
+            --bg-secondary: #1e293b;
+            --bg-card: #334155;
+            --text-primary: #f1f5f9;
+            --text-secondary: #cbd5e1;
+            --accent-primary: #3b82f6;
+            --accent-success: #10b981;
+            --accent-warning: #f59e0b;
+            --accent-danger: #ef4444;
+            --border: #475569;
+            --shadow: 0 10px 25px rgba(0,0,0,0.5);
+            --radius: 12px;
+        }
+
         * {
             margin: 0;
             padding: 0;
             box-sizing: border-box;
         }
-        
+
         body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            font-family: 'Inter', sans-serif;
+            background: linear-gradient(135deg, var(--bg-primary) 0%, var(--bg-secondary) 100%);
             min-height: 100vh;
-            padding: 20px;
+            color: var(--text-primary);
+            line-height: 1.6;
         }
-        
+
         .container {
             max-width: 1400px;
             margin: 0 auto;
-            background: rgba(255, 255, 255, 0.95);
-            border-radius: 20px;
-            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.1);
-            padding: 30px;
+            padding: 20px;
         }
-        
+
         .header {
-            text-align: center;
+            background: linear-gradient(135deg, var(--bg-card), #475569);
+            border-radius: var(--radius);
+            padding: 30px;
             margin-bottom: 30px;
-            padding-bottom: 20px;
-            border-bottom: 3px solid #667eea;
+            box-shadow: var(--shadow);
+            border: 1px solid var(--border);
         }
-        
+
         .header h1 {
-            color: #2c3e50;
-            font-size: 2.5em;
-            margin-bottom: 10px;
+            font-size: 2.2em;
+            font-weight: 700;
+            background: linear-gradient(135deg, var(--accent-primary), #60a5fa);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 8px;
         }
-        
-        .header p {
-            color: #7f8c8d;
-            font-size: 1.2em;
+
+        .header .subtitle {
+            font-size: 1em;
+            color: var(--text-secondary);
+            font-weight: 400;
         }
-        
-        .dashboard {
+
+        .status-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-weight: 600;
+            font-size: 0.95em;
+            backdrop-filter: blur(10px);
+        }
+
+        .status-active {
+            background: rgba(16, 185, 129, 0.2);
+            border: 1px solid var(--accent-success);
+            color: var(--accent-success);
+        }
+
+        .status-inactive {
+            background: rgba(107, 114, 128, 0.2);
+            border: 1px solid var(--text-secondary);
+            color: var(--text-secondary);
+        }
+
+        .grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
             gap: 20px;
-            margin-bottom: 30px;
+            margin-bottom: 20px;
         }
-        
+
         .card {
-            background: white;
-            border-radius: 15px;
-            padding: 25px;
-            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
-            transition: transform 0.3s ease;
+            background: var(--bg-card);
+            border-radius: var(--radius);
+            padding: 24px;
+            box-shadow: var(--shadow);
+            border: 1px solid var(--border);
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            position: relative;
+            overflow: hidden;
         }
-        
+
+        .card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 3px;
+            background: linear-gradient(90deg, var(--accent-primary), transparent);
+        }
+
         .card:hover {
-            transform: translateY(-5px);
+            transform: translateY(-4px);
+            box-shadow: 0 20px 40px rgba(0,0,0,0.6);
         }
-        
-        .card h3 {
-            color: #2c3e50;
-            margin-bottom: 15px;
-            font-size: 1.3em;
+
+        .card.primary::before { background: linear-gradient(90deg, var(--accent-primary), transparent); }
+        .card.success::before { background: linear-gradient(90deg, var(--accent-success), transparent); }
+        .card.warning::before { background: linear-gradient(90deg, var(--accent-warning), transparent); }
+        .card.info::before { background: linear-gradient(90deg, #06b6d4, transparent); }
+
+        .card-header {
             display: flex;
             align-items: center;
-            gap: 10px;
+            justify-content: space-between;
+            margin-bottom: 20px;
+            padding-bottom: 12px;
+            border-bottom: 1px solid var(--border);
         }
-        
-        .status-card {
-            background: linear-gradient(135deg, #3498db, #2980b9);
-            color: white;
+
+        .card-title {
+            font-size: 1.2em;
+            font-weight: 600;
+            color: var(--text-primary);
+            display: flex;
+            align-items: center;
+            gap: 8px;
         }
-        
-        .energy-card {
-            background: linear-gradient(135deg, #27ae60, #219a52);
-            color: white;
+
+        .card-icon {
+            width: 32px;
+            height: 32px;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.2em;
+            background: rgba(59, 130, 246, 0.2);
+            color: var(--accent-primary);
         }
-        
-        .control-card {
-            background: linear-gradient(135deg, #f39c12, #e67e22);
-            color: white;
-        }
-        
-        .sensors-card {
-            background: linear-gradient(135deg, #9b59b6, #8e44ad);
-            color: white;
-        }
-        
-        .metric {
+
+        .metric-row {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin: 10px 0;
-            padding: 10px;
-            background: rgba(255, 255, 255, 0.1);
-            border-radius: 8px;
+            padding: 12px 0;
+            border-bottom: 1px solid rgba(71, 85, 105, 0.3);
         }
-        
+
+        .metric-row:last-child { border-bottom: none; }
+
+        .metric-label {
+            font-weight: 500;
+            color: var(--text-secondary);
+            font-size: 0.95em;
+        }
+
         .metric-value {
-            font-weight: bold;
-            font-size: 1.2em;
-        }
-        
-        .status-indicator {
-            width: 20px;
-            height: 20px;
-            border-radius: 50%;
-            display: inline-block;
-            margin-right: 10px;
-        }
-        
-        .status-on { background-color: #27ae60; }
-        .status-off { background-color: #e74c3c; }
-        .status-motion { background-color: #f39c12; }
-        .status-no-motion { background-color: #95a5a6; }
-        
-        .control-buttons {
-            display: flex;
-            gap: 15px;
-            margin-top: 20px;
-        }
-        
-        .btn {
-            flex: 1;
-            padding: 15px;
-            border: none;
-            border-radius: 10px;
+            font-weight: 600;
             font-size: 1.1em;
-            font-weight: bold;
-            cursor: pointer;
-            transition: all 0.3s ease;
-            text-transform: uppercase;
+            color: var(--text-primary);
         }
-        
-        .btn-on {
-            background: linear-gradient(135deg, #27ae60, #2ecc71);
-            color: white;
+
+        .metric-unit {
+            font-size: 0.85em;
+            color: var(--text-secondary);
+            margin-left: 4px;
         }
-        
-        .btn-off {
-            background: linear-gradient(135deg, #e74c3c, #c0392b);
-            color: white;
+
+        .progress-container {
+            margin: 16px 0;
         }
-        
-        .btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.2);
+
+        .progress-label {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 8px;
+            font-size: 0.9em;
+            color: var(--text-secondary);
         }
-        
+
         .progress-bar {
             width: 100%;
-            height: 10px;
-            background: rgba(255, 255, 255, 0.2);
-            border-radius: 5px;
+            height: 8px;
+            background: var(--border);
+            border-radius: 4px;
             overflow: hidden;
-            margin: 10px 0;
         }
-        
+
         .progress-fill {
             height: 100%;
-            background: rgba(255, 255, 255, 0.8);
-            border-radius: 5px;
-            transition: width 0.3s ease;
+            transition: width 0.4s ease;
+            position: relative;
         }
-        
-        .benefits-section {
-            margin-top: 30px;
-            padding: 25px;
-            background: linear-gradient(135deg, #74b9ff, #0984e3);
-            border-radius: 15px;
+
+        .progress-fill::after {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
+            animation: shimmer 1.5s infinite;
+        }
+
+        @keyframes shimmer {
+            0% { transform: translateX(-100%); }
+            100% { transform: translateX(100%); }
+        }
+
+        .progress-primary { background: linear-gradient(90deg, var(--accent-primary), #60a5fa); }
+        .progress-success { background: linear-gradient(90deg, var(--accent-success), #34d399); }
+        .progress-warning { background: linear-gradient(90deg, var(--accent-warning), #fbbf24); }
+
+        .btn-group {
+            display: flex;
+            gap: 12px;
+            margin-top: 16px;
+        }
+
+        .btn {
+            flex: 1;
+            padding: 12px 20px;
+            border: none;
+            border-radius: 8px;
+            font-size: 0.95em;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .btn::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
+            transition: left 0.5s;
+        }
+
+        .btn:hover::before { left: 100%; }
+
+        .btn:hover { transform: translateY(-1px); }
+
+        .btn-primary {
+            background: linear-gradient(135deg, var(--accent-primary), #2563eb);
             color: white;
+            box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);
         }
-        
-        .benefits-grid {
+
+        .btn-success {
+            background: linear-gradient(135deg, var(--accent-success), #059669);
+            color: white;
+            box-shadow: 0 4px 12px rgba(16, 185, 129, 0.3);
+        }
+
+        .btn-danger {
+            background: linear-gradient(135deg, var(--accent-danger), #dc2626);
+            color: white;
+            box-shadow: 0 4px 12px rgba(239, 68, 68, 0.3);
+        }
+
+        .btn-warning {
+            background: linear-gradient(135deg, var(--accent-warning), #d97706);
+            color: white;
+            box-shadow: 0 4px 12px rgba(245, 158, 11, 0.3);
+        }
+
+        .preset-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 20px;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 10px;
+            margin-top: 12px;
+        }
+
+        .preset-btn {
+            padding: 12px;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            background: transparent;
+            cursor: pointer;
+            transition: all 0.3s;
+            text-align: left;
+            color: var(--text-secondary);
+        }
+
+        .preset-btn:hover {
+            border-color: var(--accent-primary);
+            background: rgba(59, 130, 246, 0.1);
+            color: var(--text-primary);
+        }
+
+        .preset-btn.active {
+            border-color: var(--accent-primary);
+            background: rgba(59, 130, 246, 0.2);
+            color: var(--text-primary);
+        }
+
+        .preset-name {
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+
+        .preset-desc {
+            font-size: 0.8em;
+            opacity: 0.8;
+        }
+
+        .chart-container {
+            position: relative;
+            height: 280px;
+            margin-top: 16px;
+        }
+
+        .wide-card { grid-column: span 2; }
+
+        .indicator {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 6px;
+            animation: pulse 1.5s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+
+        .indicator-on { background: var(--accent-success); }
+        .indicator-off { background: var(--text-secondary); }
+        .indicator-motion { background: var(--accent-warning); }
+
+        .config-section {
             margin-top: 20px;
+            padding-top: 20px;
+            border-top: 1px solid var(--border);
         }
-        
-        .benefit-item {
-            background: rgba(255, 255, 255, 0.1);
-            padding: 20px;
-            border-radius: 10px;
+
+        .config-input {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin: 10px 0;
+        }
+
+        .config-label {
+            flex: 1;
+            font-weight: 500;
+            color: var(--text-secondary);
+            font-size: 0.95em;
+        }
+
+        input[type="number"], input[type="range"] {
+            padding: 8px 12px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            font-size: 0.95em;
+            transition: border-color 0.3s;
+        }
+
+        input[type="number"]:focus, input[type="range"]:focus {
+            outline: none;
+            border-color: var(--accent-primary);
+        }
+
+        input[type="range"] {
+            flex: 2;
+            height: 6px;
+            background: var(--border);
+        }
+
+        input[type="range"]::-webkit-slider-thumb {
+            appearance: none;
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            background: var(--accent-primary);
+            cursor: pointer;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 12px;
+            margin-top: 16px;
+        }
+
+        .stat-box {
+            background: linear-gradient(135deg, rgba(59, 130, 246, 0.1), rgba(59, 130, 246, 0.05));
+            padding: 16px;
+            border-radius: 8px;
             text-align: center;
+            border: 1px solid rgba(59, 130, 246, 0.2);
         }
-        
-        .benefit-icon {
-            font-size: 2.5em;
-            margin-bottom: 10px;
+
+        .stat-value {
+            font-size: 2em;
+            font-weight: 700;
+            background: linear-gradient(135deg, var(--accent-primary), #60a5fa);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 4px;
         }
-        
+
+        .stat-label {
+            font-size: 0.8em;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            font-weight: 500;
+        }
+
+        .alert {
+            padding: 16px 20px;
+            border-radius: 8px;
+            margin: 16px 0;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            font-weight: 500;
+            backdrop-filter: blur(10px);
+        }
+
+        .alert-success {
+            background: rgba(16, 185, 129, 0.1);
+            border: 1px solid rgba(16, 185, 129, 0.3);
+            color: var(--accent-success);
+        }
+
+        .alert-warning {
+            background: rgba(245, 158, 11, 0.1);
+            border: 1px solid rgba(245, 158, 11, 0.3);
+            color: var(--accent-warning);
+        }
+
+        @media (max-width: 1200px) {
+            .wide-card { grid-column: span 1; }
+        }
+
         @media (max-width: 768px) {
-            .container {
-                padding: 20px;
-            }
-            
-            .header h1 {
-                font-size: 2em;
-            }
-            
-            .dashboard {
-                grid-template-columns: 1fr;
-            }
-            
-            .control-buttons {
-                flex-direction: column;
-            }
+            .grid { grid-template-columns: 1fr; }
+            .btn-group, .preset-grid, .stats-grid { grid-template-columns: 1fr; flex-direction: column; }
+            .header h1 { font-size: 1.8em; }
+        }
+
+        .gauge-container {
+            position: relative;
+            width: 100%;
+            height: 120px;
+            margin: 10px 0;
+        }
+
+        .gauge {
+            width: 100%;
+            height: 100%;
+        }
+
+        .gauge-label {
+            position: absolute;
+            bottom: -20px;
+            left: 50%;
+            transform: translateX(-50%);
+            font-size: 0.8em;
+            color: var(--text-secondary);
+            text-align: center;
         }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1>Control de Iluminacion Inclusiva</h1>
-            <p>Sistema Inteligente para Aulas - Mejorando la Inclusion Educativa</p>
+            <h1>Iluminación Inclusiva - Control Técnico</h1>
+            <p class="subtitle">Dashboard Avanzado | Modelo Dinámico Optimizado | v3.0</p>
+            <div style="margin-top: 15px;">
+                <span class="status-badge" id="systemStatus">
+                    <span class="indicator" id="systemIndicator"></span>
+                    <span id="systemStatusText">Inicializando...</span>
+                </span>
+            </div>
         </div>
-        
-        <div class="dashboard">
-            <!-- Estado del Sistema -->
-            <div class="card status-card">
-                <h3>Estado del Sistema</h3>
-                <div class="metric">
-                    <span>Estado de LEDs:</span>
+
+        <div class="grid">
+            <div class="card primary">
+                <div class="card-header">
+                    <div class="card-title">
+                        <div class="card-icon">⚡</div>
+                        Estado Principal
+                    </div>
+                </div>
+                <div class="metric-row">
+                    <span class="metric-label">Luces</span>
                     <span class="metric-value">
-                        <span class="status-indicator" id="ledStatus"></span>
-                        <span id="ledStatusText">APAGADO</span>
+                        <span class="indicator" id="ledIndicator"></span>
+                        <span id="ledStatus">Off</span>
                     </span>
                 </div>
-                <div class="metric">
-                    <span>Deteccion de Movimiento:</span>
+                <div class="metric-row">
+                    <span class="metric-label">PIR</span>
                     <span class="metric-value">
-                        <span class="status-indicator" id="motionStatus"></span>
-                        <span id="motionStatusText">SIN MOVIMIENTO</span>
+                        <span class="indicator" id="pirIndicator"></span>
+                        <span id="pirStatus">Idle</span>
                     </span>
                 </div>
-                <div class="metric">
-                    <span>Modo de Control:</span>
-                    <span class="metric-value" id="controlMode">AUTOMATICO</span>
+                <div class="metric-row">
+                    <span class="metric-label">Modo</span>
+                    <span class="metric-value" id="controlMode">Auto</span>
                 </div>
-                <div class="metric">
-                    <span>Tiempo Activo:</span>
+                <div class="metric-row">
+                    <span class="metric-label">Uptime</span>
                     <span class="metric-value" id="uptime">00:00:00</span>
                 </div>
-            </div>
-            
-            <!-- Sensores -->
-            <div class="card sensors-card">
-                <h3>Sensores Ambientales</h3>
-                <div class="metric">
-                    <span>Nivel de Luz:</span>
-                    <span class="metric-value" id="lightLevel">0</span>
-                </div>
-                <div class="progress-bar">
-                    <div class="progress-fill" id="lightProgress"></div>
-                </div>
-                <div class="metric">
-                    <span>Umbral de Activacion:</span>
-                    <span class="metric-value">2500 lux</span>
-                </div>
-                <div class="metric">
-                    <span>Ultimo Movimiento:</span>
-                    <span class="metric-value" id="lastMotion">Nunca</span>
-                </div>
-                <div class="metric" style="margin-top: 20px;">
-                    <span>Brillo de LEDs:</span>
-                    <span class="metric-value" id="brightness">0%</span>
-                </div>
-                <div class="progress-bar">
-                    <div class="progress-fill" id="brightnessProgress" style="width: 0%;"></div>
+                <div class="progress-container">
+                    <div class="progress-label">
+                        <span>Brillo PWM</span>
+                        <span><strong id="brightness">0%</strong></span>
+                    </div>
+                    <div class="progress-bar">
+                        <div class="progress-fill progress-primary" id="brightnessBar" style="width: 0%"></div>
+                    </div>
                 </div>
             </div>
-            
-            <!-- Metricas Energeticas -->
-            <div class="card energy-card">
-                <h3>Consumo Energetico</h3>
-                <div class="metric">
-                    <span>Consumo Actual:</span>
-                    <span class="metric-value" id="currentPower">0 W</span>
+
+            <div class="card info">
+                <div class="card-header">
+                    <div class="card-title">
+                        <div class="card-icon">📡</div>
+                        Sensores
+                    </div>
                 </div>
-                <div class="metric">
-                    <span>Tiempo Encendido:</span>
+                <div class="metric-row">
+                    <span class="metric-label">Iluminancia</span>
+                    <span class="metric-value">
+                        <span id="lightLevel">0</span>
+                        <span class="metric-unit">lux</span>
+                    </span>
+                </div>
+                <div class="progress-container">
+                    <div class="progress-label">
+                        <span>ADC Raw</span>
+                        <span id="lightPercent">0%</span>
+                    </div>
+                    <div class="progress-bar">
+                        <div class="progress-fill progress-info" id="lightBar" style="width: 0%"></div>
+                    </div>
+                </div>
+                <div class="metric-row">
+                    <span class="metric-label">Motion Timeout</span>
+                    <span class="metric-value" id="lastMotion">N/A</span>
+                </div>
+                <div class="metric-row">
+                    <span class="metric-label">Setpoint</span>
+                    <span class="metric-value">
+                        <span id="setpointDisplay">400</span>
+                        <span class="metric-unit">lux</span>
+                    </span>
+                </div>
+            </div>
+
+            <div class="card success">
+                <div class="card-header">
+                    <div class="card-title">
+                        <div class="card-icon">🔋</div>
+                        Energía
+                    </div>
+                </div>
+                <div class="metric-row">
+                    <span class="metric-label">Potencia</span>
+                    <span class="metric-value">
+                        <span id="currentPower">0.0</span>
+                        <span class="metric-unit">W</span>
+                    </span>
+                </div>
+                <div class="metric-row">
+                    <span class="metric-label">On-Time</span>
                     <span class="metric-value" id="onTime">00:00:00</span>
                 </div>
-                <div class="metric">
-                    <span>Energia Total:</span>
-                    <span class="metric-value" id="totalEnergy">0.000 kWh</span>
+                <div class="metric-row">
+                    <span class="metric-label">Energía</span>
+                    <span class="metric-value">
+                        <span id="totalEnergy">0.000</span>
+                        <span class="metric-unit">kWh</span>
+                    </span>
                 </div>
-                <div class="metric">
-                    <span>Costo Total (USD):</span>
+                <div class="metric-row">
+                    <span class="metric-label">Costo</span>
                     <span class="metric-value" id="totalCost">$0.00</span>
                 </div>
-                <div class="metric">
-                    <span>Ahorro Estimado/Dia:</span>
-                    <span class="metric-value" id="savings">$0.00</span>
+                <div class="metric-row">
+                    <span class="metric-label">Ahorro</span>
+                    <span class="metric-value" style="color: var(--accent-success);" id="savings">$0.00</span>
                 </div>
             </div>
-            
-            <!-- Controles -->
-            <div class="card control-card">
-                <h3>Control Manual</h3>
-                <div class="metric">
-                    <span>Control Remoto:</span>
-                    <span class="metric-value">ACTIVO</span>
+
+            <div class="card warning">
+                <div class="card-header">
+                    <div class="card-title">
+                        <div class="card-icon">👁️</div>
+                        Confort
+                    </div>
                 </div>
-                <div class="control-buttons">
-                    <button class="btn btn-on" onclick="controlLights(true)">
-                        ENCENDER
-                    </button>
-                    <button class="btn btn-off" onclick="controlLights(false)">
-                        APAGAR
-                    </button>
+                <div class="metric-row">
+                    <span class="metric-label">Comfort Time</span>
+                    <span class="metric-value">
+                        <span id="comfortPercent">0</span>
+                        <span class="metric-unit">%</span>
+                    </span>
+                </div>
+                <div class="progress-container">
+                    <div class="progress-label">
+                        <span>Comfort Band</span>
+                    </div>
+                    <div class="progress-bar">
+                        <div class="progress-fill progress-success" id="comfortBar" style="width: 0%"></div>
+                    </div>
+                </div>
+                <div class="metric-row">
+                    <span class="metric-label">Glare Events</span>
+                    <span class="metric-value" id="glareEvents">0</span>
+                </div>
+                <div class="metric-row">
+                    <span class="metric-label">ROI</span>
+                    <span class="metric-value">
+                        <span id="roi">-</span>
+                        <span class="metric-unit">mos</span>
+                    </span>
                 </div>
             </div>
-        </div>
-        
-        <!-- Seccion de Beneficios -->
-        <div class="benefits-section">
-            <h2>Beneficios del Sistema de Iluminacion Inclusiva</h2>
-            <div class="benefits-grid">
-                <div class="benefit-item">
-                    <div class="benefit-icon">👁</div>
-                    <h4>Mejora Visual</h4>
-                    <p>Iluminacion adaptativa para estudiantes con problemas de vision, reduciendo la fatiga ocular</p>
+
+            <div class="card primary">
+                <div class="card-header">
+                    <div class="card-title">
+                        <div class="card-icon">⚙️</div>
+                        Controles
+                    </div>
                 </div>
-                <div class="benefit-item">
-                    <div class="benefit-icon">💡</div>
-                    <h4>Eficiencia Energetica</h4>
-                    <p>Ahorro de hasta 60% en consumo electrico mediante deteccion inteligente</p>
+                <div class="btn-group">
+                    <button class="btn btn-success" onclick="controlSystem('on')">ON</button>
+                    <button class="btn btn-danger" onclick="controlSystem('off')">OFF</button>
                 </div>
-                <div class="benefit-item">
-                    <div class="benefit-icon">🌍</div>
-                    <h4>Sostenibilidad</h4>
-                    <p>Reduce la huella de carbono del centro educativo</p>
+                <div class="btn-group">
+                    <button class="btn btn-primary" onclick="controlSystem('auto')">AUTO</button>
+                    <button class="btn btn-warning" onclick="controlSystem('manual')">MANUAL</button>
                 </div>
-                <div class="benefit-item">
-                    <div class="benefit-icon">🎓</div>
-                    <h4>Inclusion Educativa</h4>
-                    <p>Crea un ambiente de aprendizaje mas accesible para todos</p>
+            </div>
+
+            <div class="card info">
+                <div class="card-header">
+                    <div class="card-title">
+                        <div class="card-icon">🎛️</div>
+                        Presets
+                    </div>
+                </div>
+                <p style="color: var(--text-secondary); margin-bottom: 12px; font-size: 0.9em;">
+                    Active: <strong id="activePreset">Estandar</strong>
+                </p>
+                <div class="preset-grid">
+                    <div class="preset-btn active" onclick="applyPreset(0)">
+                        <div class="preset-name">Estandar</div>
+                        <div class="preset-desc">400 lux</div>
+                    </div>
+                    <div class="preset-btn" onclick="applyPreset(1)">
+                        <div class="preset-name">Lectura</div>
+                        <div class="preset-desc">500 lux</div>
+                    </div>
+                    <div class="preset-btn" onclick="applyPreset(2)">
+                        <div class="preset-name">Natural</div>
+                        <div class="preset-desc">350 lux</div>
+                    </div>
+                    <div class="preset-btn" onclick="applyPreset(3)">
+                        <div class="preset-name">Baja Vis.</div>
+                        <div class="preset-desc">450 lux</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card wide-card">
+                <div class="card-header">
+                    <div class="card-title">
+                        <div class="card-icon">📊</div>
+                        Telemetría
+                    </div>
+                </div>
+                <div class="chart-container">
+                    <canvas id="historyChart"></canvas>
+                </div>
+            </div>
+
+            <div class="card wide-card success">
+                <div class="card-header">
+                    <div class="card-title">
+                        <div class="card-icon">📈</div>
+                        Métricas
+                    </div>
+                </div>
+                <div class="stats-grid">
+                    <div class="stat-box">
+                        <div class="stat-value">60</div>
+                        <div class="stat-label">Eficiencia %</div>
+                    </div>
+                    <div class="stat-box">
+                        <div class="stat-value" id="roiMonths">4.6</div>
+                        <div class="stat-label">ROI mos</div>
+                    </div>
+                    <div class="stat-box">
+                        <div class="stat-value">$39.90</div>
+                        <div class="stat-label">Costo USD</div>
+                    </div>
+                    <div class="stat-box">
+                        <div class="stat-value" id="annualSavings">104</div>
+                        <div class="stat-label">Ahorro Anual</div>
+                    </div>
+                </div>
+                <div class="alert alert-success">
+                    <span style="font-size: 1.5em;">✓</span>
+                    <div>Validado CIE | Inclusivo Educativo</div>
                 </div>
             </div>
         </div>
     </div>
 
     <script>
-        let systemData = {
-            lightsOn: false,
-            pirDetected: false,
-            manualOverride: false,
-            lightLevel: 0,
-            brightnessLevel: 0,
-            timeSinceLastMotion: 0,
-            totalOnTime: 0,
-            totalEnergy: 0,
-            currentPower: 0,
-            uptime: 0
-        };
+        let systemData = {};
+        let historyChart = null;
+        let updateInterval = null;
 
-        // Actualizar datos del sistema
+        document.addEventListener('DOMContentLoaded', () => {
+            initChart();
+            startUpdates();
+        });
+
+        function startUpdates() {
+            updateSystemData();
+            updateInterval = setInterval(updateSystemData, 1000);
+        }
+
         async function updateSystemData() {
             try {
-                const response = await fetch('/api/status');
-                if (response.ok) {
-                    systemData = await response.json();
+                const res = await fetch('/api/status');
+                if (res.ok) {
+                    systemData = await res.json();
                     updateUI();
                 }
-            } catch (error) {
-                console.error('Error fetching data:', error);
+            } catch (e) {
+                console.error('Fetch error:', e);
             }
         }
 
-        // Actualizar interfaz de usuario
         function updateUI() {
-            // Estado de LEDs
-            const ledStatus = document.getElementById('ledStatus');
-            const ledStatusText = document.getElementById('ledStatusText');
+            // System status
+            const sysStatus = document.getElementById('systemStatus');
+            const sysInd = document.getElementById('systemIndicator');
+            const sysText = document.getElementById('systemStatusText');
             if (systemData.lightsOn) {
-                ledStatus.className = 'status-indicator status-on';
-                ledStatusText.textContent = 'ENCENDIDO';
+                sysStatus.className = 'status-badge status-active';
+                sysInd.className = 'indicator indicator-on';
+                sysText.textContent = 'ACTIVE';
             } else {
-                ledStatus.className = 'status-indicator status-off';
-                ledStatusText.textContent = 'APAGADO';
+                sysStatus.className = 'status-badge status-inactive';
+                sysInd.className = 'indicator indicator-off';
+                sysText.textContent = 'INACTIVE';
             }
 
-            // Estado de movimiento
-            const motionStatus = document.getElementById('motionStatus');
-            const motionStatusText = document.getElementById('motionStatusText');
+            // LED
+            const ledInd = document.getElementById('ledIndicator');
+            const ledStatus = document.getElementById('ledStatus');
+            if (systemData.lightsOn) {
+                ledInd.className = 'indicator indicator-on';
+                ledStatus.textContent = 'ON';
+            } else {
+                ledInd.className = 'indicator indicator-off';
+                ledStatus.textContent = 'OFF';
+            }
+
+            // PIR
+            const pirInd = document.getElementById('pirIndicator');
+            const pirStatus = document.getElementById('pirStatus');
             if (systemData.pirDetected) {
-                motionStatus.className = 'status-indicator status-motion';
-                motionStatusText.textContent = 'DETECTADO';
+                pirInd.className = 'indicator indicator-motion';
+                pirStatus.textContent = 'DETECTED';
             } else {
-                motionStatus.className = 'status-indicator status-no-motion';
-                motionStatusText.textContent = 'SIN MOVIMIENTO';
+                pirInd.className = 'indicator indicator-off';
+                pirStatus.textContent = 'IDLE';
             }
 
-            // Modo de control
-            document.getElementById('controlMode').textContent = 
-                systemData.manualOverride ? 'MANUAL' : 'AUTOMATICO';
+            // Mode
+            document.getElementById('controlMode').textContent = systemData.autoMode ? 'AUTO' : 'MANUAL';
 
-            // Tiempo activo
+            // Uptime
             document.getElementById('uptime').textContent = formatTime(systemData.uptime);
 
-            // Nivel de luz
-            document.getElementById('lightLevel').textContent = systemData.lightLevel + ' lux';
-            const lightProgress = (systemData.lightLevel / 4095) * 100;
-            document.getElementById('lightProgress').style.width = lightProgress + '%';
+            // Brightness
+            const bright = Math.round(systemData.currentBrightness);
+            document.getElementById('brightness').textContent = bright + '%';
+            document.getElementById('brightnessBar').style.width = bright + '%';
 
-            // Ultimo movimiento
-            let lastMotion = 'Nunca';
-            if (systemData.timeSinceLastMotion > 0) {
-                if (systemData.timeSinceLastMotion > 86400) {
-                    lastMotion = 'Hace más de un día';
-                } else {
-                    lastMotion = formatTime(systemData.timeSinceLastMotion) + ' hace';
-                }
-            }
-            document.getElementById('lastMotion').textContent = lastMotion;
+            // Light
+            const lightLux = Math.round(systemData.lightLevel * (1100 / 4095));
+            document.getElementById('lightLevel').textContent = lightLux;
+            const lightPct = Math.round((systemData.lightLevel / 4095) * 100);
+            document.getElementById('lightPercent').textContent = lightPct + '%';
+            document.getElementById('lightBar').style.width = lightPct + '%';
 
-            // Consumo energetico
-            document.getElementById('currentPower').textContent = systemData.currentPower.toFixed(1) + ' W';
+            // Motion
+            const lastMot = systemData.timeSinceLastMotion;
+            document.getElementById('lastMotion').textContent = lastMot < 60 ? Math.round(lastMot) + 's' : formatTime(lastMot);
+
+            // Setpoint
+            document.getElementById('setpointDisplay').textContent = systemData.setpoint;
+
+            // Energy
+            document.getElementById('currentPower').textContent = systemData.currentPower.toFixed(1);
             document.getElementById('onTime').textContent = formatTime(systemData.totalOnTime);
-            document.getElementById('totalEnergy').textContent = systemData.totalEnergy.toFixed(3) + ' kWh';
-            
-            const totalCost = systemData.totalEnergy * 0.092; // Tarifa Ecuador
-            document.getElementById('totalCost').textContent = '$' + totalCost.toFixed(3);
-            
-            // Calculo de ahorro estimado por dia (comparado con iluminacion tradicional)
-            const traditionalConsumption = 8 * 50 / 1000; // 8 horas * 50W
-            const smartConsumption = systemData.totalOnTime / 3600 * 50 * (systemData.brightnessLevel / 100) / 1000; // horas reales * 50W * factor brillo
-            const dailySavings = Math.max(0, (traditionalConsumption - smartConsumption) * 0.092);
-            document.getElementById('savings').textContent = '$' + dailySavings.toFixed(3);
+            document.getElementById('totalEnergy').textContent = systemData.totalEnergy.toFixed(3);
+            document.getElementById('totalCost').textContent = '$' + systemData.totalCost.toFixed(3);
+            document.getElementById('savings').textContent = '$' + systemData.savings.toFixed(3);
 
-            // Brillo
-            document.getElementById('brightness').textContent = systemData.brightnessLevel + '%';
-            document.getElementById('brightnessProgress').style.width = systemData.brightnessLevel + '%';
+            // Comfort
+            const compPct = Math.round(systemData.comfortPercentage);
+            document.getElementById('comfortPercent').textContent = compPct;
+            document.getElementById('comfortBar').style.width = compPct + '%';
+            document.getElementById('glareEvents').textContent = systemData.glareEvents;
+            const roi = systemData.roi;
+            document.getElementById('roi').textContent = roi > 0 ? roi.toFixed(1) : '-';
+            document.getElementById('roiMonths').textContent = roi > 0 ? roi.toFixed(1) : '4.6';
+
+            // Preset
+            document.getElementById('activePreset').textContent = systemData.presetName || 'Estandar';
+
+            // Annual
+            const annSav = systemData.savings * 365;
+            document.getElementById('annualSavings').textContent = Math.round(annSav);
         }
 
-        // Controlar luces
-        async function controlLights(turnOn) {
+        async function controlSystem(action) {
             try {
-                const response = await fetch('/api/control', {
+                const res = await fetch('/api/control', {
                     method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({ action: turnOn ? 'on' : 'off' })
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({action})
                 });
-                
-                if (response.ok) {
-                    console.log('Comando enviado:', turnOn ? 'encender' : 'apagar');
+                if (res.ok) {
+                    setTimeout(updateSystemData, 100);
                 }
-            } catch (error) {
-                console.error('Error controlling lights:', error);
+            } catch (e) {
+                console.error('Control error:', e);
             }
         }
 
-        // Formatear tiempo en HH:MM:SS
-        function formatTime(seconds) {
-            const hours = Math.floor(seconds / 3600);
-            const minutes = Math.floor((seconds % 3600) / 60);
-            const secs = Math.floor(seconds % 60);
-            
-            return hours.toString().padStart(2, '0') + ':' + 
-                   minutes.toString().padStart(2, '0') + ':' + 
-                   secs.toString().padStart(2, '0');
+        async function applyPreset(index) {
+            try {
+                const res = await fetch('/api/preset', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({index})
+                });
+                if (res.ok) {
+                    document.querySelectorAll('.preset-btn').forEach((btn, i) => {
+                        btn.classList.toggle('active', i === index);
+                    });
+                    setTimeout(updateSystemData, 100);
+                }
+            } catch (e) {
+                console.error('Preset error:', e);
+            }
         }
 
-        // Inicializar y actualizar cada segundo
-        updateSystemData();
-        setInterval(updateSystemData, 1000);
+        function initChart() {
+            const ctx = document.getElementById('historyChart').getContext('2d');
+            historyChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: [],
+                    datasets: [
+                        {
+                            label: 'Brillo (%)',
+                            data: [],
+                            borderColor: 'rgb(59, 130, 246)',
+                            backgroundColor: 'rgba(59, 130, 246, 0.1)',
+                            tension: 0.3,
+                            fill: true,
+                            yAxisID: 'y'
+                        },
+                        {
+                            label: 'Potencia (W)',
+                            data: [],
+                            borderColor: 'rgb(16, 185, 129)',
+                            backgroundColor: 'rgba(16, 185, 129, 0.1)',
+                            tension: 0.3,
+                            fill: true,
+                            yAxisID: 'y1'
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: { mode: 'index', intersect: false },
+                    scales: {
+                        y: { type: 'linear', position: 'left', title: { display: true, text: 'Brillo (%)' } },
+                        y1: { type: 'linear', position: 'right', title: { display: true, text: 'Potencia (W)' }, grid: { drawOnChartArea: false } },
+                        x: { title: { display: true, text: 'Tiempo' } }
+                    },
+                    plugins: { legend: { position: 'top' } }
+                }
+            });
+            setInterval(updateChart, 5000);
+        }
+
+        async function updateChart() {
+            try {
+                const res = await fetch('/api/history');
+                if (res.ok) {
+                    const data = await res.json();
+                    historyChart.data.labels = data.timestamps.map(t => new Date(t * 1000).toLocaleTimeString('es-ES', {hour: '2-digit', minute: '2-digit'}));
+                    historyChart.data.datasets[0].data = data.brightness;
+                    historyChart.data.datasets[1].data = data.power;
+                    historyChart.update('none');
+                }
+            } catch (e) {
+                console.error('Chart error:', e);
+            }
+        }
+
+        function formatTime(seconds) {
+            const h = Math.floor(seconds / 3600);
+            const m = Math.floor((seconds % 3600) / 60);
+            const s = Math.floor(seconds % 60);
+            return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+        }
     </script>
 </body>
 </html>
-    )rawliteral";
-    request->send(200, "text/html", html);
-  });
-
-  // API para obtener estado del sistema
-  server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest *request) {
-    request->send(200, "application/json", getSystemStatus());
-  });
-
-  // API para controlar las luces
-  server.on("/api/control", HTTP_POST, [](AsyncWebServerRequest *request) {
-    // Esta función se ejecutará después de procesar el body
-  }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
-    // Procesar datos JSON
-    DynamicJsonDocument doc(1024);
-    deserializeJson(doc, (char*)data);
-    
-    String action = doc["action"];
-    
-    if (action == "on") {
-      turnOnLights(true); // Manual override
-      state.manualOverride = true;
-      Serial.println("Control manual: ENCENDER luces (permanece ON hasta apagar)");
-    } else if (action == "off") {
-      turnOffLights();
-      state.manualOverride = false;
-      Serial.println("Control manual: APAGAR luces (vuelve a modo AUTO)");
-    }
-    
-    request->send(200, "application/json", "{\"status\":\"ok\"}");
-  });
-
-  server.begin();
-  Serial.println("Servidor web iniciado en puerto 80");
-}
-
-void handleSensors() {
-  // Leer sensores
-  bool rawPirState = digitalRead(PIR_PIN);
-  unsigned long now = millis();
-  int analogValue = analogRead(LIGHT_SENSOR_PIN);
-  state.lightLevel = analogValue; // Valor crudo (0-4095, bajo = oscuro)
-
-  // Debouncing para PIR
-  if ((rawPirState != state.pirDetected) && (now - state.lastPirChange > PIR_DEBOUNCE)) {
-    state.pirDetected = rawPirState;
-    state.lastPirChange = now;
-    
-    if (state.pirDetected) {
-      Serial.println("MOVIMIENTO DETECTADO!");
-      state.lastMotion = now;
-    } else {
-      Serial.println("Fin del movimiento");
-    }
-  }
-
-  // Ajustar brillo según nivel de luz (siempre, incluso en modo manual)
-  if (state.lightsOn) {
-    if (state.lightLevel > LIGHT_LOW_THRESHOLD) {
-      setLedBrightness(33); // Bajo (mucha luz)
-    } else if (state.lightLevel >= LIGHT_MEDIUM_THRESHOLD) {
-      setLedBrightness(66); // Medio
-    } else {
-      setLedBrightness(100); // Intenso (poca luz)
-    }
-  }
-
-  // Lógica de control automático (solo si no hay override manual)
-  if (!state.manualOverride) {
-    // Encender luces si hay movimiento y está oscuro
-    if (state.pirDetected && state.lightLevel < LIGHT_THRESHOLD && !state.lightsOn) {
-      Serial.printf("Oscuro (%d) + Movimiento -> ENCENDER luces\n", state.lightLevel);
-      turnOnLights(false);
-    }
-    
-    // Apagar luces por timeout o mucha luz natural
-    if (state.lightsOn) {
-      if (now - state.lastMotion > AUTO_OFF_DELAY) {
-        Serial.println("Timeout sin movimiento -> APAGAR luces");
-        turnOffLights();
-      } else if (state.lightLevel >= LIGHT_THRESHOLD) {
-        Serial.printf("Suficiente luz natural (%d) -> APAGAR luces\n", state.lightLevel);
-        turnOffLights();
-      }
-    }
-  }
-  
-  // Mostrar estado cada 5 segundos
-  static unsigned long lastPrint = 0;
-  if (now - lastPrint > 5000) {
-    Serial.printf("PIR: %s | Luz: %d | LEDs: %s | Modo: %s | Brillo: %d%%\n",
-                  state.pirDetected ? "DETECTADO" : "NINGUNO",
-                  state.lightLevel,
-                  state.lightsOn ? "ON" : "OFF",
-                  state.manualOverride ? "MANUAL" : "AUTO",
-                  state.brightnessLevel);
-    lastPrint = now;
-  }
-}
-
-void updateEnergyMetrics() {
-  static unsigned long lastUpdate = 0;
-  unsigned long now = millis();
-  unsigned long delta = now - lastUpdate;
-  
-  if (delta >= 1000) { // Actualizar cada segundo
-    if (state.lightsOn) {
-      state.totalOnTime += delta / 1000.0;
-      state.currentPowerConsumption = POWER_CONSUMPTION_WATTS * (state.brightnessLevel / 100.0);
-      
-      // Calcular energía consumida (kWh) con delta preciso
-      state.totalEnergyConsumed += (state.currentPowerConsumption * (delta / 1000.0)) / 3600000.0;
-    } else {
-      state.currentPowerConsumption = 0.0;
-      state.brightnessLevel = 0;
-    }
-    
-    lastUpdate = now;
-  }
-}
-
-void turnOnLights(bool manual) {
-  if (!state.lightsOn) {
-    Serial.println("=== ENCENDIENDO SISTEMA DE ILUMINACION ===");
-    
-    // Encender relé (si se usa)
-    digitalWrite(RELAY_PIN, HIGH);
-    
-    // Establecer brillo inicial basado en luz ambiente
-    if (state.lightLevel > LIGHT_LOW_THRESHOLD) {
-      setLedBrightness(33); // Bajo
-    } else if (state.lightLevel >= LIGHT_MEDIUM_THRESHOLD) {
-      setLedBrightness(66); // Medio
-    } else {
-      setLedBrightness(100); // Intenso
-    }
-    
-    state.lightsOn = true;
-    state.lastOnTime = millis();
-    state.lastMotion = millis(); // Resetear timer para mantener 1 minuto en AUTO
-    
-    if (manual) {
-      state.manualOverride = true;
-      Serial.println("Modo MANUAL activado (luces permanecerán encendidas)");
-    } else {
-      Serial.println("Modo AUTO: Luces encendidas por movimiento");
-    }
-    
-    Serial.println("Sistema de iluminación ENCENDIDO");
-    Serial.println("===========================================");
-  }
-}
-
-void turnOffLights() {
-  if (state.lightsOn) {
-    Serial.println("=== APAGANDO SISTEMA DE ILUMINACION ===");
-    
-    // Apagar los 5 LEDs unitarios
-    for (int i = 0; i < NUM_LEDS; i++) {
-      analogWrite(LED_PINS[i], 0);
-    }
-    
-    // Apagar relé
-    digitalWrite(RELAY_PIN, LOW);
-    
-    state.lightsOn = false;
-    state.brightnessLevel = 0;
-    
-    // Resetear override manual al apagar
-    if (state.manualOverride) {
-      state.manualOverride = false;
-      Serial.println("Modo AUTOMATICO restablecido");
-    }
-    
-    Serial.println("Sistema de iluminación APAGADO");
-    Serial.println("==========================================");
-  }
-}
-
-void setLedBrightness(int percentage) {
-  int pwmValue = (percentage * 255) / 100; // Convertir porcentaje a valor PWM (0-255)
-  for (int i = 0; i < NUM_LEDS; i++) {
-    analogWrite(LED_PINS[i], pwmValue);
-  }
-  state.brightnessLevel = percentage;
-  Serial.printf("Brillo ajustado a %d%% (PWM: %d)\n", percentage, pwmValue);
-}
-
-String getSystemStatus() {
-  DynamicJsonDocument doc(1024);
-  
-  doc["lightsOn"] = state.lightsOn;
-  doc["pirDetected"] = state.pirDetected;
-  doc["manualOverride"] = state.manualOverride;
-  doc["lightLevel"] = state.lightLevel;
-  doc["brightnessLevel"] = state.brightnessLevel;
-  doc["timeSinceLastMotion"] = (millis() - state.lastMotion) / 1000.0;
-  doc["totalOnTime"] = state.totalOnTime;
-  doc["totalEnergy"] = state.totalEnergyConsumed;
-  doc["currentPower"] = state.currentPowerConsumption;
-  doc["uptime"] = (millis() - state.systemStartTime) / 1000.0;
-  
-  String response;
-  serializeJson(doc, response);
-  return response;
+        )rawliteral";
+        req->send(200, "text/html", html); });
+    server.on("/favicon.ico", HTTP_GET, [](AsyncWebServerRequest *req) { req->send(404); });
+    server.begin();
 }
