@@ -1,6 +1,6 @@
 # 🏫 Sistema de Control Inclusivo de Iluminación en Aula
 
-**Universidad de Guayaquil - Facultad de Ciencias e Ingeniería**  
+**Universidad de Milagro - Facultad de Ciencias e Ingeniería**  
 **Carrera: Ingeniería de Software**  
 **Asignatura: Modelos Matemáticos y Simulación**
 
@@ -394,7 +394,7 @@ Obtener datos históricos.
 **Docente**: Ing. Jhonny Darwin Ortiz Mata
 
 **Fecha**: 28/09/2025  
-**Universidad de Guayaquil - Ecuador**
+**Universidad de Milagro - Ecuador**
 
 ---
 
@@ -406,7 +406,7 @@ Este proyecto es desarrollado con fines académicos para la asignatura de Modelo
 
 ## 🙏 Agradecimientos
 
-- Universidad de Guayaquil
+- Universidad de Milagro
 - Facultad de Ciencias e Ingeniería
 - Comunidad de Wokwi
 - Desarrolladores de PlatformIO y Arduino
